@@ -1,0 +1,643 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Config Service Data Layer - DynamoDB Configuration Table, ECR Repository, and KMS Keys for us-east-1 region'
+
+################################################################################
+#                                 PARAMETERS                                    #
+################################################################################
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource naming'
+
+################################################################################
+#                                 RESOURCES                                     #
+################################################################################
+
+Resources:
+  ############################################################################
+  #                         ENCRYPTION (KMS)                                 #
+  ############################################################################
+
+  # KMS Key for DynamoDB Encryption
+  DynamoDBKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      Description: !Sub 'KMS key for Config Service ${Environment} DynamoDB table encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:Create*'
+              - 'kms:Describe*'
+              - 'kms:Enable*'
+              - 'kms:List*'
+              - 'kms:Put*'
+              - 'kms:Update*'
+              - 'kms:Revoke*'
+              - 'kms:Disable*'
+              - 'kms:Get*'
+              - 'kms:Delete*'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:CancelKeyDeletion'
+              - 'kms:TagResource'
+              - 'kms:UntagResource'
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+            Resource: '*'
+          - Sid: Allow DynamoDB to use the key
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+              - 'kms:CreateGrant'
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+        - Key: Component
+          Value: encryption
+
+  DynamoDBKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/config-service-${Environment}-dynamodb'
+      TargetKeyId: !Ref DynamoDBKMSKey
+
+  # KMS Key for ECR Encryption
+  ECRKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      Description: !Sub 'KMS key for Config Service ${Environment} ECR encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:Create*'
+              - 'kms:Describe*'
+              - 'kms:Enable*'
+              - 'kms:List*'
+              - 'kms:Put*'
+              - 'kms:Update*'
+              - 'kms:Revoke*'
+              - 'kms:Disable*'
+              - 'kms:Get*'
+              - 'kms:Delete*'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:CancelKeyDeletion'
+              - 'kms:TagResource'
+              - 'kms:UntagResource'
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+            Resource: '*'
+          - Sid: Allow ECR to use the key
+            Effect: Allow
+            Principal:
+              Service: ecr.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+              - 'kms:Encrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+        - Key: Component
+          Value: encryption
+
+  ECRKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/config-service-${Environment}-ecr'
+      TargetKeyId: !Ref ECRKMSKey
+
+  ############################################################################
+  #                         DYNAMODB TABLE                                   #
+  ############################################################################
+
+  # Configuration Table (Multi-Tenant)
+  ConfigurationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'config-service-${Environment}-configurations'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-configurations'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+        - Key: Component
+          Value: configuration-storage
+
+  ############################################################################
+  #                      PARAMETER STORE (IMAGE TAGS)                        #
+  ############################################################################
+
+  # Current Image Tag Parameter
+  CurrentImageTagParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/config-service/${Environment}/current-image-tag'
+      Description: !Sub 'Current Docker image tag for Config Service ${Environment} environment'
+      Type: String
+      Value: 'latest'
+
+  # Previous Image Tag Parameter (for rollback)
+  PreviousImageTagParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/config-service/${Environment}/previous-image-tag'
+      Description: !Sub 'Previous Docker image tag for Config Service ${Environment} environment (rollback)'
+      Type: String
+      Value: 'none'
+
+  ############################################################################
+  #                        COGNITO USER POOL                                 #
+  ############################################################################
+
+  # Cognito User Pool for multi-tenant authentication
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'config-service-${Environment}-users'
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+        - Name: tenantId
+          AttributeDataType: String
+          Mutable: false
+          DeveloperOnlyAttribute: false
+        - Name: role
+          AttributeDataType: String
+          Mutable: true
+          DeveloperOnlyAttribute: false
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate:
+          - email
+      UserPoolAddOns:
+        AdvancedSecurityMode: ENFORCED
+
+  # User Pool Domain for hosted UI
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'config-service-${Environment}-${AWS::AccountId}'
+      UserPoolId: !Ref CognitoUserPool
+
+  # User Pool Client for application access
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'config-service-${Environment}-client'
+      UserPoolId: !Ref CognitoUserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      ReadAttributes:
+        - email
+        - email_verified
+        - custom:tenantId
+        - custom:role
+      WriteAttributes:
+        - email
+        - custom:role
+
+  # Cognito Groups
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Admins
+      Description: Administrator users with access to all tenants
+      UserPoolId: !Ref CognitoUserPool
+      Precedence: 1
+
+  UsersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Users
+      Description: Regular users with tenant-scoped access
+      UserPoolId: !Ref CognitoUserPool
+      Precedence: 2
+
+  ViewersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Viewers
+      Description: Read-only users with tenant-scoped access
+      UserPoolId: !Ref CognitoUserPool
+      Precedence: 3
+
+  ############################################################################
+  #                           ECR REPOSITORY                                 #
+  ############################################################################
+
+  # S3 Bucket for access logs
+  LambdaDeploymentLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'config-service-${Environment}-lambda-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  # Bucket Policy for access logs bucket
+  LambdaDeploymentLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LambdaDeploymentLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${LambdaDeploymentLogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt LambdaDeploymentLogsBucket.Arn
+              - !Sub '${LambdaDeploymentLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # S3 Bucket for Lambda deployment packages
+  LambdaDeploymentBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LambdaDeploymentLogsBucketPolicy
+    Properties:
+      BucketName: !Sub 'config-service-${Environment}-lambda-deployment-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt ECRKMSKey.Arn
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LambdaDeploymentLogsBucket
+        LogFilePrefix: lambda-deployment-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+        - Key: Component
+          Value: lambda-deployment
+
+  # Bucket Policy for Lambda deployment bucket
+  LambdaDeploymentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LambdaDeploymentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt LambdaDeploymentBucket.Arn
+              - !Sub '${LambdaDeploymentBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - 's3:GetObject'
+            Resource: !Sub '${LambdaDeploymentBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+# ECR Repository for Config Service
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub 'config-service-${Environment}'
+      EmptyOnDelete: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt ECRKMSKey.Arn
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only 10 most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPushPull
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 'ecr:GetDownloadUrlForLayer'
+              - 'ecr:BatchGetImage'
+              - 'ecr:BatchCheckLayerAvailability'
+              - 'ecr:PutImage'
+              - 'ecr:InitiateLayerUpload'
+              - 'ecr:UploadLayerPart'
+              - 'ecr:CompleteLayerUpload'
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+        - Key: Component
+          Value: container-registry
+
+  # ECR Repository for Order Service
+  OrderServiceECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub 'order-service-${Environment}'
+      EmptyOnDelete: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt ECRKMSKey.Arn
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPushPull
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 'ecr:GetDownloadUrlForLayer'
+              - 'ecr:BatchGetImage'
+              - 'ecr:BatchCheckLayerAvailability'
+              - 'ecr:PutImage'
+              - 'ecr:InitiateLayerUpload'
+              - 'ecr:UploadLayerPart'
+              - 'ecr:CompleteLayerUpload'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: order-service
+        - Key: Component
+          Value: container-registry
+
+################################################################################
+#                                  OUTPUTS                                      #
+################################################################################
+
+Outputs:
+  DynamoDBKMSKey:
+    Description: DynamoDB KMS Key ARN
+    Value: !GetAtt DynamoDBKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-dynamodb-kms-key'
+
+  ConfigurationTable:
+    Description: DynamoDB Configuration Table Name
+    Value: !Ref ConfigurationTable
+    Export:
+      Name: !Sub '${AWS::StackName}-config-table'
+
+  ConfigurationTableArn:
+    Description: DynamoDB Configuration Table ARN
+    Value: !GetAtt ConfigurationTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-config-table-arn'
+
+  ConfigurationTableStreamArn:
+    Description: DynamoDB Configuration Table Stream ARN
+    Value: !GetAtt ConfigurationTable.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-config-table-stream-arn'
+
+  ECRRepository:
+    Description: ECR Repository Name
+    Value: !Ref ECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-ecr-repository'
+
+  ECRRepositoryUri:
+    Description: ECR Repository URI
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ecr-repository-uri'
+
+  ECRKMSKey:
+    Description: ECR KMS Key ARN
+    Value: !GetAtt ECRKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ecr-kms-key'
+
+  CurrentImageTagParameter:
+    Description: SSM Parameter for current image tag
+    Value: !Ref CurrentImageTagParameter
+    Export:
+      Name: !Sub '${AWS::StackName}-current-image-tag-param'
+
+  PreviousImageTagParameter:
+    Description: SSM Parameter for previous image tag
+    Value: !Ref PreviousImageTagParameter
+    Export:
+      Name: !Sub '${AWS::StackName}-previous-image-tag-param'
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-cognito-user-pool-id'
+
+  CognitoUserPoolArn:
+    Description: Cognito User Pool ARN
+    Value: !GetAtt CognitoUserPool.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-cognito-user-pool-arn'
+
+  CognitoUserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-cognito-user-pool-client-id'
+
+  CognitoUserPoolDomain:
+    Description: Cognito User Pool Domain
+    Value: !Sub 'config-service-${Environment}-${AWS::AccountId}'
+    Export:
+      Name: !Sub '${AWS::StackName}-cognito-user-pool-domain'
+
+  OrderServiceECRRepository:
+    Description: Order Service ECR Repository Name
+    Value: !Ref OrderServiceECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-order-service-ecr-repository'
+
+  OrderServiceECRRepositoryUri:
+    Description: Order Service ECR Repository URI
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${OrderServiceECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-order-service-ecr-repository-uri'
+
+  LambdaDeploymentBucket:
+    Description: S3 Bucket for Lambda deployment packages
+    Value: !Ref LambdaDeploymentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-deployment-bucket'
+

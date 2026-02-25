@@ -1,0 +1,1842 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Config Service Application Infrastructure - VPC, Private ALB, ECS Fargate for us-east-1 region'
+
+################################################################################
+#                                 PARAMETERS                                    #
+################################################################################
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource naming'
+
+  CidrBlock:
+    Type: String
+    Description: VPC CIDR Block
+    Default: 10.0.0.0/16
+
+  DataStackName:
+    Type: String
+    Default: 'config-service-data'
+    Description: 'Name of the CloudFormation stack that contains DynamoDB table and ECR repository'
+
+  SSMPathPrefix:
+    Type: String
+    Default: '/config-service'
+    Description: 'SSM Parameter Store path prefix for configuration parameters'
+
+################################################################################
+#                                  MAPPINGS                                     #
+################################################################################
+
+Mappings:
+  CidrMappings:
+    private-subnet-1:
+      CIDR: 10.0.1.0/24
+    private-subnet-2:
+      CIDR: 10.0.3.0/24
+
+################################################################################
+#                                 CONDITIONS                                    #
+################################################################################
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+
+################################################################################
+#                                 RESOURCES                                     #
+################################################################################
+
+Resources:
+  ############################################################################
+  #                            VPC & NETWORKING                              #
+  ############################################################################
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref CidrBlock
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  # Private Subnets (for ECS tasks and internal ALB)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      MapPublicIpOnLaunch: false
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [CidrMappings, private-subnet-1, CIDR]
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-private-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      MapPublicIpOnLaunch: false
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [CidrMappings, private-subnet-2, CIDR]
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-private-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-private-rt'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  ############################################################################
+  #                          SECURITY GROUPS                                 #
+  ############################################################################
+
+  # ECS Fargate Security Group (Config Service)
+  ECSFargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ECS Fargate tasks - allows communication between containers and ALB access on port 3000
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-ecs-fargate-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+        - Key: Component
+          Value: ecs-security
+
+  ECSFargateSecurityGroupIngressTCP:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow ECS Fargate tasks to communicate with each other on port 3000
+      GroupId: !Ref ECSFargateSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref ECSFargateSecurityGroup
+      SourceSecurityGroupOwnerId: !Ref AWS::AccountId
+
+  # Config Service doesn't need ALB access anymore - only internal gRPC
+
+  ECSFargateSecurityGroupEgressALBHTTP:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow ECS Fargate tasks to communicate back to Application Load Balancer on port 80
+      GroupId: !Ref ECSFargateSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      DestinationSecurityGroupId: !Ref ALBSecurityGroup
+
+  ECSFargateSecurityGroupEgressHTTPS:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow all HTTPS outbound traffic from ECS Fargate tasks for VPC endpoints (ECR, SSM, DynamoDB, Logs)
+      GroupId: !Ref ECSFargateSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  ECSFargateSecurityGroupEgressDNS:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow DNS queries from ECS Fargate tasks within VPC
+      GroupId: !Ref ECSFargateSecurityGroup
+      IpProtocol: udp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref CidrBlock
+
+  # ALB Security Group (Private - VPC CIDR only)
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application Load Balancer security group - allows HTTP traffic from VPC CIDR only for internal access
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-alb-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+        - Key: Component
+          Value: alb-security
+
+  # ALB Security Group Ingress from VPC CIDR
+  ALBSecurityGroupIngressVPC:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow HTTP traffic on port 80 from VPC CIDR
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref CidrBlock
+      GroupId: !Ref ALBSecurityGroup
+
+  ALBSecurityGroupIngressECSHTTP:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow ECS Fargate tasks to communicate back to ALB on port 80
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref ECSFargateSecurityGroup
+      GroupId: !Ref ALBSecurityGroup
+
+  ALBSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow outbound traffic to Order Service on port 3001
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3001
+      ToPort: 3001
+      DestinationSecurityGroupId: !Ref OrderServiceECSSecurityGroup
+
+  # VPC Endpoints Security Group
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC endpoints - allows HTTPS traffic from ECS tasks to AWS services (DynamoDB, SSM, ECR)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ECSFargateSecurityGroup
+          Description: Allow HTTPS traffic from ECS Fargate tasks to VPC endpoints
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref CidrBlock
+          Description: Allow HTTPS responses back to VPC CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-vpc-endpoint-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+        - Key: Component
+          Value: vpc-endpoint-security
+
+  ############################################################################
+  #                           VPC ENDPOINTS                                  #
+  ############################################################################
+
+  DynamoDBVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  SSMVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  ECRApiVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-ecr-api-endpoint'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ECRDkrVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-ecr-dkr-endpoint'
+        - Key: Environment
+          Value: !Ref Environment
+
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  LogsVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-logs-endpoint'
+        - Key: Environment
+          Value: !Ref Environment
+
+  MonitoringVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.monitoring'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-monitoring-endpoint'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Cognito VPC Endpoint
+  CognitoIdpVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.cognito-idp'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-cognito-idp-endpoint'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ############################################################################
+  #                         ENCRYPTION (KMS)                                 #
+  ############################################################################
+
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      Description: !Sub 'KMS key for config-service-${Environment} encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:Create*'
+              - 'kms:Describe*'
+              - 'kms:Enable*'
+              - 'kms:List*'
+              - 'kms:Put*'
+              - 'kms:Update*'
+              - 'kms:Revoke*'
+              - 'kms:Disable*'
+              - 'kms:Get*'
+              - 'kms:Delete*'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:CancelKeyDeletion'
+              - 'kms:GenerateDataKey'
+              - 'kms:Decrypt'
+              - 'kms:Encrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:CreateGrant'
+              - 'kms:TagResource'
+              - 'kms:UntagResource'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+          - Sid: Allow VPC Flow Logs
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpc/flowlogs/config-service-${Environment}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/config-service-${Environment}'
+      TargetKeyId: !Ref KMSKey
+
+  ############################################################################
+  #                          VPC FLOW LOGS                                   #
+  ############################################################################
+
+  # VPC Flow Logs for network traffic monitoring and security analysis
+  VPCFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: KMSKey
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs/config-service-${Environment}'
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt KMSKey.Arn
+
+  VPCFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: VPCFlowLogDeliveryRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpc/flowlogs/config-service-${Environment}*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogRole.Arn
+      LogFormat: '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status}'
+      MaxAggregationInterval: 60
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-vpc-flow-log'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ############################################################################
+  #                          API GATEWAY & VPC LINK                          #
+  ############################################################################
+
+  # Security Group for API Gateway VPC Link
+  APIGatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for API Gateway VPC Link
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref CidrBlock
+          Description: Allow traffic to ALB
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-apigw-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # VPC Link to connect API Gateway to private ALB
+  VPCLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub 'config-service-${Environment}-vpc-link'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref APIGatewaySecurityGroup
+      Tags:
+        Environment: !Ref Environment
+        Service: config-service
+
+  # REST API (API Gateway v1) with Cognito Authentication and WAF
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'config-service-${Environment}-api'
+      Description: !Sub 'Config Service REST API Gateway for ${Environment} environment with HTTPS, Cognito auth, and WAF'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # Cognito Authorizer for REST API
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub 'config-service-${Environment}-cognito-authorizer'
+      Type: COGNITO_USER_POOLS
+      RestApiId: !Ref RestApi
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !Sub
+          - 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}'
+          - UserPoolId: !ImportValue
+              Fn::Sub: '${DataStackName}-cognito-user-pool-id'
+
+  # CloudWatch Log Group for API Gateway
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/config-service-${Environment}'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt KMSKey.Arn
+
+  ############################################################################
+  #                    API GATEWAY SECURITY ALARMS                           #
+  ############################################################################
+
+  # Alarm for high 4xx errors (client errors)
+  ApiGateway4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'config-service-${Environment}-api-4xx-errors'
+      AlarmDescription: 'Alert when API Gateway 4xx errors exceed threshold'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub 'config-service-${Environment}-api'
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  # Alarm for high 5xx errors (server errors)
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'config-service-${Environment}-api-5xx-errors'
+      AlarmDescription: 'Alert when API Gateway 5xx errors exceed threshold'
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub 'config-service-${Environment}-api'
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  # Alarm for high latency
+  ApiGatewayLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'config-service-${Environment}-api-high-latency'
+      AlarmDescription: 'Alert when API Gateway latency is high'
+      MetricName: Latency
+      Namespace: AWS/ApiGateway
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub 'config-service-${Environment}-api'
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  ############################################################################
+  #                          AWS WAF                                         #
+  ############################################################################
+
+  # WAF Web ACL for API Gateway (requires manual association)
+  WAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub 'config-service-${Environment}-waf'
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: RateLimitRule
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitRule
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSetMetric
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSetMetric
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub 'config-service-${Environment}-waf'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  ############################################################################
+  #                    APPLICATION LOAD BALANCER (PRIVATE)                   #
+  ############################################################################
+
+  # ALB Access Logs S3 Bucket
+  ALBLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'config-service-${Environment}-alb-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 7
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  ALBLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ALBLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSLogDeliveryWrite
+            Effect: Allow
+            Principal:
+              Service: logdelivery.elasticloadbalancing.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${ALBLogsBucket.Arn}/*'
+          - Sid: AWSLogDeliveryAclCheck
+            Effect: Allow
+            Principal:
+              Service: logdelivery.elasticloadbalancing.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt ALBLogsBucket.Arn
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - ALBLogsBucketPolicy
+    Properties:
+      Name: !Sub 'config-service-${Environment}-alb'
+      Scheme: internal
+      Type: application
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+        - Key: deletion_protection.enabled
+          Value: 'false'
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref ALBLogsBucket
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-private-alb'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  # Target Group for Order Service REST API
+  TargetGroupHTTP:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub 'order-service-${Environment}-http-tg'
+      Port: 3001
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /api/v1/health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '300'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: order-service
+
+  # HTTP Listener for REST API (port 80) - forwards all traffic to Order Service
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupHTTP
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  ############################################################################
+  #                    API GATEWAY RESOURCES & METHODS                       #
+  ############################################################################
+
+  # /api resource
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: api
+
+  # /api/v1 resource
+  ApiV1Resource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResource
+      PathPart: v1
+
+  # /api/v1/health resource
+  HealthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiV1Resource
+      PathPart: health
+
+  # GET /api/v1/health method (no auth)
+  HealthGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref HealthResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: GET
+        Uri: !Sub 'http://${ApplicationLoadBalancer.DNSName}/api/v1/health'
+        ConnectionType: VPC_LINK
+        ConnectionId: !Ref VPCLink
+        IntegrationTarget: !Ref ApplicationLoadBalancer
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+
+  # /api/v1/orders resource
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiV1Resource
+      PathPart: orders
+
+  # GET /api/v1/orders method (with Cognito auth)
+  OrdersGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: GET
+        Uri: !Sub 'http://${ApplicationLoadBalancer.DNSName}/api/v1/orders'
+        ConnectionType: VPC_LINK
+        ConnectionId: !Ref VPCLink
+        IntegrationTarget: !Ref ApplicationLoadBalancer
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+
+  # POST /api/v1/orders method (with Cognito auth)
+  OrdersPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'http://${ApplicationLoadBalancer.DNSName}/api/v1/orders'
+        ConnectionType: VPC_LINK
+        ConnectionId: !Ref VPCLink
+        IntegrationTarget: !Ref ApplicationLoadBalancer
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+
+  # /api/v1/orders/{id} resource
+  OrderByIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref OrdersResource
+      PathPart: '{id}'
+
+  # GET /api/v1/orders/{id} method (with Cognito auth)
+  OrderByIdGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref OrderByIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: GET
+        Uri: !Sub 'http://${ApplicationLoadBalancer.DNSName}/api/v1/orders/{id}'
+        ConnectionType: VPC_LINK
+        ConnectionId: !Ref VPCLink
+        IntegrationTarget: !Ref ApplicationLoadBalancer
+        RequestParameters:
+          integration.request.path.id: method.request.path.id
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+
+  # API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - HealthGetMethod
+      - OrdersGetMethod
+      - OrdersPostMethod
+      - OrderByIdGetMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: Initial deployment
+
+  # API Stage with logging and throttling
+  # API Stage with logging, throttling, caching, and X-Ray tracing
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub '${Environment} stage'
+      TracingEnabled: true
+      CacheClusterEnabled: true
+      CacheClusterSize: '0.5'
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '$context.requestId $context.error.message $context.error.messageString $context.identity.sourceIp $context.requestTime $context.httpMethod $context.resourcePath $context.status $context.protocol $context.responseLength'
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 5000
+          ThrottlingRateLimit: 2000
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+          CachingEnabled: true
+          CacheTtlInSeconds: 300
+          CacheDataEncrypted: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  # API Usage Plan
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiStage
+    Properties:
+      UsagePlanName: !Sub '${AWS::StackName}-usage-plan'
+      Description: !Sub 'Usage plan for ${Environment} environment'
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: !Ref ApiStage
+      Throttle:
+        BurstLimit: 5000
+        RateLimit: 2000
+      Quota:
+        Limit: 1000000
+        Period: MONTH
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  # API Key (optional - for usage tracking)
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiStage
+    Properties:
+      Name: !Sub '${AWS::StackName}-api-key'
+      Description: !Sub 'API Key for ${Environment} environment'
+      Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  # Associate API Key with Usage Plan
+  ApiUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+  # WAF Association with REST API
+  WAFWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: ApiStage
+    Properties:
+      ResourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${RestApi}/stages/${ApiStage}'
+      WebACLArn: !GetAtt WAFWebACL.Arn
+
+  ############################################################################
+  #                      AWS CLOUD MAP (SERVICE DISCOVERY)                   #
+  ############################################################################
+
+  # Private DNS Namespace for service discovery
+  CloudMapNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub 'config-service-${Environment}.local'
+      Vpc: !Ref VPC
+      Description: Private DNS namespace for config service discovery
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  # Service Discovery Service for Config Service
+  ConfigServiceDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: config-service
+      Description: Service discovery for Config Service
+      DnsConfig:
+        NamespaceId: !Ref CloudMapNamespace
+        DnsRecords:
+          - Type: A
+            TTL: 60
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  ############################################################################
+  #                         ECS CLUSTER & SERVICE                            #
+  ############################################################################
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub 'config-service-${Environment}'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Configuration:
+        ManagedStorageConfiguration:
+          KmsKeyId: !Ref KMSKey
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 4
+          Base: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+          Base: 0
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  # TaskRole - ECS Task IAM Role
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+      Policies:
+        - PolicyName: TaskRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:DescribeTable'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:BatchWriteItem'
+                Resource:
+                  - !Sub
+                    - 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ConfigTable}'
+                    - ConfigTable: !ImportValue
+                        Fn::Sub: '${DataStackName}-config-table'
+                  - !Sub
+                    - 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ConfigTable}/index/*'
+                    - ConfigTable: !ImportValue
+                        Fn::Sub: '${DataStackName}-config-table'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref AWS::Region
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParametersByPath'
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SSMPathPrefix}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SSMPathPrefix}/*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref AWS::Region
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:DescribeKey'
+                  - 'kms:Encrypt'
+                  - 'kms:GenerateDataKey'
+                  - 'kms:CreateGrant'
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: '${DataStackName}-dynamodb-kms-key'
+                  - !GetAtt KMSKey.Arn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService':
+                      - !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+                      - !Sub 'ssm.${AWS::Region}.amazonaws.com'
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource:
+                  - !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace':
+                      - 'ConfigService'
+                      - 'ConfigService/API'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !GetAtt LogGroup.Arn
+
+  # TaskExecutionRole - ECS Task Execution IAM Role
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+      Policies:
+        - PolicyName: TaskExecutionRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                Resource:
+                  - !Sub
+                    - 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepo}'
+                    - ECRRepo: !ImportValue
+                        Fn::Sub: '${DataStackName}-ecr-repository'
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/config-service/${Environment}/current-image-tag'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/config-service/${Environment}/previous-image-tag'
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:DescribeKey'
+                Resource: !GetAtt KMSKey.Arn
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/config-service-${Environment}*'
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/config-service-${Environment}'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt KMSKey.Arn
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'config-service-${Environment}'
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      Cpu: 512
+      Memory: 1024
+      ContainerDefinitions:
+        - Name: !Sub 'config-service-${Environment}'
+          Image: !Sub
+            - '${ECRRepoUri}:latest'
+            - ECRRepoUri: !ImportValue
+                Fn::Sub: '${DataStackName}-ecr-repository-uri'
+          PortMappings:
+            - ContainerPort: 3000
+              HostPort: 3000
+              Protocol: tcp
+            - ContainerPort: 5000
+              HostPort: 5000
+              Protocol: tcp
+          Privileged: false
+          Environment:
+            - Name: DYNAMO_CONFIG_TABLE
+              Value: !ImportValue
+                Fn::Sub: '${DataStackName}-config-table'
+            - Name: SSM_PATH
+              Value: !Ref SSMPathPrefix
+            - Name: PORT
+              Value: '3000'
+            - Name: NODE_ENV
+              Value: !Ref Environment
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: TRACING_ENABLED
+              Value: 'false'
+            - Name: COGNITO_USER_POOL_ID
+              Value: !ImportValue
+                Fn::Sub: '${DataStackName}-cognito-user-pool-id'
+            - Name: COGNITO_CLIENT_ID
+              Value: !ImportValue
+                Fn::Sub: '${DataStackName}-cognito-user-pool-client-id'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Sub 'config-service-${Environment}'
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListenerHTTP
+    Properties:
+      ServiceName: !Sub 'config-service-${Environment}-service'
+      TaskDefinition: !Ref TaskDefinition
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: !If [IsProd, 2, 1]
+      DeploymentController:
+        Type: ECS
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSFargateSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ConfigServiceDiscoveryService.Arn
+      HealthCheckGracePeriodSeconds: 60
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  ############################################################################
+  #                    ORDER SERVICE - SECURITY GROUP                        #
+  ############################################################################
+
+  # Order Service ECS Security Group
+  OrderServiceECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Order Service ECS Fargate tasks
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'order-service-${Environment}-ecs-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: order-service
+
+  # Allow ALB to reach Order Service
+  OrderServiceSecurityGroupIngressALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow Application Load Balancer to reach Order Service on port 3001
+      GroupId: !Ref OrderServiceECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3001
+      ToPort: 3001
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  # Allow Order Service to communicate with itself
+  OrderServiceSecurityGroupIngressSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow Order Service tasks to communicate with each other
+      GroupId: !Ref OrderServiceECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3001
+      ToPort: 3001
+      SourceSecurityGroupId: !Ref OrderServiceECSSecurityGroup
+
+  # Allow HTTPS outbound for AWS services
+  OrderServiceSecurityGroupEgressHTTPS:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow HTTPS outbound for AWS services
+      GroupId: !Ref OrderServiceECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  # Allow Order Service to call Config Service on gRPC port (5000)
+  OrderServiceSecurityGroupEgressConfigService:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow Order Service to call Config Service gRPC endpoint
+      GroupId: !Ref OrderServiceECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5000
+      ToPort: 5000
+      DestinationSecurityGroupId: !Ref ECSFargateSecurityGroup
+
+  # Allow DNS queries
+  OrderServiceSecurityGroupEgressDNS:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow DNS queries
+      GroupId: !Ref OrderServiceECSSecurityGroup
+      IpProtocol: udp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref CidrBlock
+
+  # Update Config Service security group to allow traffic from Order Service
+  ConfigServiceSecurityGroupIngressFromOrderService:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow Order Service to call Config Service on gRPC port
+      GroupId: !Ref ECSFargateSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5000
+      ToPort: 5000
+      SourceSecurityGroupId: !Ref OrderServiceECSSecurityGroup
+
+  # Allow VPC endpoint access from Order Service
+  VPCEndpointSecurityGroupIngressFromOrderService:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow HTTPS traffic from Order Service to VPC endpoints
+      GroupId: !Ref VPCEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref OrderServiceECSSecurityGroup
+
+  ############################################################################
+  #                    ORDER SERVICE - ECS RESOURCES                         #
+  ############################################################################
+
+  # Order Service CloudWatch Log Group
+  OrderServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/order-service-${Environment}'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt KMSKey.Arn
+
+  # Order Service Task Role
+  OrderServiceTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+      Policies:
+        - PolicyName: OrderServiceTaskRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !GetAtt OrderServiceLogGroup.Arn
+
+  # Order Service Task Execution Role
+  OrderServiceTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+      Policies:
+        - PolicyName: OrderServiceTaskExecutionRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                Resource:
+                  - !Sub
+                    - 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${OrderServiceECRRepo}'
+                    - OrderServiceECRRepo: !ImportValue
+                        Fn::Sub: '${DataStackName}-order-service-ecr-repository'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !GetAtt OrderServiceLogGroup.Arn
+
+  # Order Service Task Definition
+  OrderServiceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'order-service-${Environment}'
+      TaskRoleArn: !GetAtt OrderServiceTaskRole.Arn
+      ExecutionRoleArn: !GetAtt OrderServiceTaskExecutionRole.Arn
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      Cpu: 256
+      Memory: 512
+      ContainerDefinitions:
+        - Name: !Sub 'order-service-${Environment}'
+          Image: !Sub
+            - '${OrderServiceECRRepoUri}:latest'
+            - OrderServiceECRRepoUri: !ImportValue
+                Fn::Sub: '${DataStackName}-order-service-ecr-repository-uri'
+          PortMappings:
+            - ContainerPort: 3001
+              HostPort: 3001
+              Protocol: tcp
+          Privileged: false
+          Environment:
+            - Name: PORT
+              Value: '3001'
+            - Name: NODE_ENV
+              Value: !Ref Environment
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: CONFIG_SERVICE_ENDPOINT
+              Value: !Sub 'config-service.config-service-${Environment}.local:5000'
+            - Name: COGNITO_USER_POOL_ID
+              Value: !ImportValue
+                Fn::Sub: '${DataStackName}-cognito-user-pool-id'
+            - Name: COGNITO_CLIENT_ID
+              Value: !ImportValue
+                Fn::Sub: '${DataStackName}-cognito-user-pool-client-id'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OrderServiceLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Sub 'order-service-${Environment}'
+
+  # Order Service ECS Service
+  OrderServiceECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListenerHTTP
+    Properties:
+      ServiceName: !Sub 'order-service-${Environment}-service'
+      TaskDefinition: !Ref OrderServiceTaskDefinition
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: !If [IsProd, 2, 1]
+      DeploymentController:
+        Type: ECS
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref OrderServiceECSSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      LoadBalancers:
+        - ContainerName: !Sub 'order-service-${Environment}'
+          ContainerPort: 3001
+          TargetGroupArn: !Ref TargetGroupHTTP
+      HealthCheckGracePeriodSeconds: 60
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: order-service
+
+  ############################################################################
+  #                          AUTO SCALING                                    #
+  ############################################################################
+
+  ServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: ECSService
+    Properties:
+      MaxCapacity: 4
+      MinCapacity: 1
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      RoleARN: !GetAtt AutoScalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: AverageCPUUtilizationPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ServiceScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 80.0
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+  # AutoScalingRole - ECS Service Auto Scaling IAM Role
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs.application-autoscaling.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: AutoScalingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !GetAtt LogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${ECSCluster}/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                Resource: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*'
+
+################################################################################
+#                                  OUTPUTS                                      #
+################################################################################
+
+Outputs:
+  VPC:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub 'config-service-${Environment}-vpc'
+    Description: 'VPC ID'
+
+  PrivateALBDNSName:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub 'config-service-${Environment}-alb-dns'
+    Description: 'Private ALB DNS Name (accessible only from within VPC)'
+
+  PrivateALBHTTPEndpoint:
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Description: 'REST API Endpoint (HTTP on port 80) - Internal only'
+
+  PrivateALBGRPCEndpoint:
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}:5000'
+    Description: 'gRPC Endpoint (HTTP/2 on port 5000) - Internal only'
+
+  ApiGatewayEndpoint:
+    Description: 'API Gateway REST API Endpoint'
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub 'config-service-${Environment}-api-endpoint'
+
+  ApiGatewayId:
+    Description: 'API Gateway REST API ID'
+    Value: !Ref RestApi
+    Export:
+      Name: !Sub 'config-service-${Environment}-api-id'
+
+  ApiUsagePlanId:
+    Description: 'API Gateway Usage Plan ID'
+    Value: !Ref ApiUsagePlan
+    Export:
+      Name: !Sub 'config-service-${Environment}-usage-plan-id'
+
+  ApiKeyId:
+    Description: 'API Gateway API Key ID'
+    Value: !Ref ApiKey
+    Export:
+      Name: !Sub 'config-service-${Environment}-api-key-id'
+
+  ApiCacheConfiguration:
+    Description: 'API Gateway Cache & Tracing Configuration (0.5GB cluster, 300s TTL, encrypted, X-Ray enabled)'
+    Value: !Sub 'Cache enabled with 5-minute TTL and encryption. X-Ray tracing enabled. To flush cache: aws apigateway flush-stage-cache --rest-api-id ${RestApi} --stage-name ${Environment}'
+
+  VPCLinkId:
+    Description: 'VPC Link V2 ID'
+    Value: !Ref VPCLink
+    Export:
+      Name: !Sub 'config-service-${Environment}-vpc-link-id'
+
+  CognitoAuthorizerId:
+    Description: 'Cognito Authorizer ID'
+    Value: !Ref CognitoAuthorizer
+    Export:
+      Name: !Sub 'config-service-${Environment}-cognito-authorizer-id'
+
+  WAFWebACLArn:
+    Description: 'WAF Web ACL ARN (Auto-associated with REST API in CloudFormation)'
+    Value: !GetAtt WAFWebACL.Arn
+    Export:
+      Name: !Sub 'config-service-${Environment}-waf-acl-arn'
+
+  WAFAssociationStatus:
+    Description: 'WAF is automatically associated with REST API via CloudFormation'
+    Value: !Sub 'WAF ${WAFWebACL.Arn} is associated with REST API ${RestApi} stage ${Environment}'
+
+  ECSCluster:
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub 'config-service-${Environment}-ecs-cluster'
+    Description: 'ECS Cluster Name'
+
+  ECSService:
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub 'config-service-${Environment}-ecs-service'
+    Description: 'ECS Service Name'
+
+  TaskDefinition:
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub 'config-service-${Environment}-task-definition'
+    Description: 'ECS Task Definition ARN'
+
+  ConfigurationTable:
+    Value: !ImportValue
+      Fn::Sub: '${DataStackName}-config-table'
+    Description: 'DynamoDB Configuration Table Name'
+
+  ECRRepositoryUri:
+    Value: !ImportValue
+      Fn::Sub: '${DataStackName}-ecr-repository-uri'
+    Description: 'ECR Repository URI for Docker images'
+
+  ECSSecurityGroup:
+    Value: !Ref ECSFargateSecurityGroup
+    Export:
+      Name: !Sub 'config-service-${Environment}-ecs-sg'
+    Description: 'ECS Fargate Security Group ID'
+
+  PrivateSubnet1:
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub 'config-service-${Environment}-private-subnet-1'
+    Description: 'Private Subnet 1 ID'
+
+  PrivateSubnet2:
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub 'config-service-${Environment}-private-subnet-2'
+    Description: 'Private Subnet 2 ID'
+
+  OrderServiceECRRepositoryUri:
+    Value: !ImportValue
+      Fn::Sub: '${DataStackName}-order-service-ecr-repository-uri'
+    Description: 'Order Service ECR Repository URI'
+
+  OrderServiceECSService:
+    Value: !Ref OrderServiceECSService
+    Export:
+      Name: !Sub 'order-service-${Environment}-ecs-service'
+    Description: 'Order Service ECS Service Name'
+
+  OrderServiceTaskDefinition:
+    Value: !Ref OrderServiceTaskDefinition
+    Export:
+      Name: !Sub 'order-service-${Environment}-task-definition'
+    Description: 'Order Service Task Definition ARN'
+
+  OrderServiceSecurityGroup:
+    Value: !Ref OrderServiceECSSecurityGroup
+    Export:
+      Name: !Sub 'order-service-${Environment}-ecs-sg'
+    Description: 'Order Service Security Group ID'
+
+  CloudMapNamespaceId:
+    Value: !Ref CloudMapNamespace
+    Export:
+      Name: !Sub 'config-service-${Environment}-cloudmap-namespace-id'
+    Description: 'Cloud Map Namespace ID'
+
+  CloudMapNamespaceName:
+    Value: !Sub 'config-service-${Environment}.local'
+    Export:
+      Name: !Sub 'config-service-${Environment}-cloudmap-namespace-name'
+    Description: 'Cloud Map Namespace Name'
+
+  ConfigServiceDiscoveryServiceArn:
+    Value: !GetAtt ConfigServiceDiscoveryService.Arn
+    Export:
+      Name: !Sub 'config-service-${Environment}-discovery-service-arn'
+    Description: 'Config Service Discovery Service ARN'
+
+  ConfigServiceDiscoveryEndpoint:
+    Value: !Sub 'config-service.config-service-${Environment}.local:5000'
+    Export:
+      Name: !Sub 'config-service-${Environment}-discovery-endpoint'
+    Description: 'Config Service Discovery DNS Endpoint for gRPC'
+
+  VPCCidr:
+    Value: !Ref CidrBlock
+    Export:
+      Name: !Sub 'config-service-${Environment}-vpc-cidr'
+    Description: 'VPC CIDR Block'
+
+  KMSKeyArn:
+    Value: !GetAtt KMSKey.Arn
+    Export:
+      Name: !Sub 'config-service-${Environment}-kms-key-arn'
+    Description: 'KMS Key ARN for encryption'
+

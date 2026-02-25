@@ -1,0 +1,19 @@
+{
+  "name": "config-service-refresh-trigger",
+  "version": "1.0.0",
+  "description": "Lambda function to trigger config service refresh on SSM/Secrets Manager changes via gRPC",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "prebuild": "npm run clean"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.11.1"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  }
+}

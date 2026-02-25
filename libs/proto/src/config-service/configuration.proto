@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package configuration;
+
+message Validations {
+  string zeroFundBalance = 1;
+  string minSIPAmount = 2;
+}
+
+message PaymentGateway {
+  string link = 1;
+  string name = 2;
+}
+
+message Config {
+  string amcCode = 1;
+  repeated Validations validations = 2;
+  repeated PaymentGateway paymentGateway = 3;
+}
+
+message Configuration {
+  string pk = 1;
+  string sk = 2;
+  repeated Config config = 3;
+}
+
+service ConfigService {
+  rpc healthCheck(Empty) returns(HealthCheckResponse) {}
+  rpc retrieveConfig(RetrieveConfigRequest) returns(RetrieveConfigResponse) {}
+  rpc retrieveConfigs(RetrieveConfigRequests) returns(RetrieveConfigResponses) {}
+  rpc refreshConfig(Empty) returns(Empty) {}
+}
+
+message Empty {}
+
+message HealthCheckResponse {
+  string data = 1;
+}
+
+message RetrieveConfigRequest {
+  string serviceName = 1;
+  string key = 2;
+}
+
+message RetrieveConfigRequests {
+  repeated string keys = 1;
+}
+
+message Secret {
+  string key = 1;
+  string value = 2;
+} 
+
+message TenantParamConfig {
+  Configuration tenant = 1;
+  repeated Secret parameters = 2;
+}
+
+message RetrieveConfigResponse {
+  TenantParamConfig data = 1;
+}
+
+message RetrieveConfigResponses {
+  map<string, string> data = 1;
+}

@@ -1,0 +1,74 @@
+{
+  "name": "order-service",
+  "version": "1.0.0",
+  "description": "Demo microservice consuming config service via gRPC",
+  "author": "",
+  "private": true,
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "scripts": {
+    "prebuild": "rimraf dist",
+    "build": "nest build",
+    "compile": "nest build",
+    "docker:build": "docker build -t order-service .",
+    "docker:run": "docker run --rm -it -p 3000:3000 order-service",
+    "start": "nest start",
+    "start:dev": "nest start --watch",
+    "start:debug": "nest start --debug --watch",
+    "start:prod": "node dist/apps/order-service/main",
+    "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.11.1",
+    "@grpc/proto-loader": "^0.7.13",
+    "uuid": "^9.0.1"
+  },
+  "jest": {
+    "moduleFileExtensions": [
+      "js",
+      "json",
+      "ts"
+    ],
+    "rootDir": ".",
+    "testRegex": ".*\\.spec\\.ts$",
+    "transform": {
+      "^.+\\.(t|j)s$": "ts-jest"
+    },
+    "collectCoverageFrom": [
+      "**/*.(t|j)s"
+    ],
+    "coverageDirectory": "./coverage",
+    "testEnvironment": "node",
+    "coveragePathIgnorePatterns": [
+      "/node_modules/",
+      "/coverage/.*",
+      "/main.ts",
+      "\\.module\\.ts$",
+      "\\.config\\.ts$",
+      "\\.mock\\.ts$"
+    ],
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "/coverage/.*",
+      "/main.ts",
+      "\\.module\\.ts$",
+      "\\.config\\.ts$",
+      "\\.mock\\.ts$"
+    ],
+    "roots": [
+      "<rootDir>/"
+    ],
+    "moduleNameMapper": {
+      "^@shared/logger(|/.*)$": "<rootDir>/../../libs/logger/src/$1",
+      "^@shared/filters(|/.*)$": "<rootDir>/../../libs/filters/src/$1",
+      "^@shared/proto(|/.*)$": "<rootDir>/../../libs/proto/src/$1",
+      "^@shared/auth(|/.*)$": "<rootDir>/../../libs/auth/src/$1"
+    }
+  }
+}

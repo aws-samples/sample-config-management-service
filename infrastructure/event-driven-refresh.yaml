@@ -1,0 +1,349 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Config Service Event-Driven Refresh - EventBridge Rules and Lambda for SSM/Secrets Manager change detection with Service Discovery'
+
+################################################################################
+#                                 PARAMETERS                                    #
+################################################################################
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource naming'
+
+  DataStackName:
+    Type: String
+    Default: 'config-service-data'
+    Description: 'Name of the CloudFormation stack that contains data resources'
+
+  AppStackName:
+    Type: String
+    Default: 'config-service-app'
+    Description: 'Name of the CloudFormation stack that contains application resources'
+
+  SSMPathPrefix:
+    Type: String
+    Default: '/config-service'
+    Description: 'SSM Parameter Store path prefix to monitor for changes'
+
+################################################################################
+#                                 RESOURCES                                     #
+################################################################################
+
+Resources:
+  ############################################################################
+  #                      LAMBDA SECURITY GROUP                               #
+  ############################################################################
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for refresh trigger Lambda function
+      VpcId: !ImportValue
+        Fn::Sub: 'config-service-${Environment}-vpc'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !ImportValue
+            Fn::Sub: 'config-service-${Environment}-vpc-cidr'
+          Description: Allow HTTPS outbound for AWS API calls within VPC
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          DestinationSecurityGroupId: !ImportValue
+            Fn::Sub: 'config-service-${Environment}-ecs-sg'
+          Description: Allow gRPC calls to Config Service on port 5000
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !ImportValue
+            Fn::Sub: 'config-service-${Environment}-vpc-cidr'
+          Description: Allow DNS queries for service discovery
+      Tags:
+        - Key: Name
+          Value: !Sub 'config-service-${Environment}-lambda-refresh-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  # Allow Lambda to reach Config Service on gRPC port 5000
+  ConfigServiceIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow refresh trigger Lambda to call Config Service gRPC endpoint
+      GroupId: !ImportValue
+        Fn::Sub: 'config-service-${Environment}-ecs-sg'
+      IpProtocol: tcp
+      FromPort: 5000
+      ToPort: 5000
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  ############################################################################
+  #                      LAMBDA EXECUTION ROLE                               #
+  ############################################################################
+
+  RefreshLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'config-service-${Environment}-lambda-refresh-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: RefreshLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/config-service-${Environment}-refresh-trigger*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:DeleteNetworkInterface'
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:AttachNetworkInterface'
+                Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - 'servicediscovery:DiscoverInstances'
+                  - 'servicediscovery:GetNamespace'
+                  - 'servicediscovery:GetService'
+                Resource: !Sub 'arn:aws:servicediscovery:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                Resource: !GetAtt RefreshLambdaDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: !ImportValue
+                  Fn::Sub: 'config-service-${Environment}-kms-key-arn'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService':
+                      - !Sub 'sqs.${AWS::Region}.amazonaws.com'
+                      - !Sub 'lambda.${AWS::Region}.amazonaws.com'
+                      - !Sub 'logs.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  ############################################################################
+  #                      LAMBDA FUNCTION                                     #
+  ############################################################################
+
+  # Dead Letter Queue for Lambda failures
+  RefreshLambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'config-service-${Environment}-refresh-lambda-dlq'
+      MessageRetentionPeriod: 1209600 # 14 days
+      KmsMasterKeyId: !ImportValue
+        Fn::Sub: 'config-service-${Environment}-kms-key-arn'
+      KmsDataKeyReusePeriodSeconds: 300 # 5 minutes
+
+  RefreshConfigLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'config-service-${Environment}-refresh-trigger'
+      Description: Triggers config service refresh using service discovery when SSM/Secrets Manager parameters change
+      Runtime: nodejs24.x
+      Handler: index.handler
+      Role: !GetAtt RefreshLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          SERVICE_DISCOVERY_ENDPOINT: !ImportValue
+            Fn::Sub: 'config-service-${Environment}-discovery-endpoint'
+          ENVIRONMENT: !Ref Environment
+      KmsKeyArn: !ImportValue
+        Fn::Sub: 'config-service-${Environment}-kms-key-arn'
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: 'config-service-${Environment}-private-subnet-1'
+          - !ImportValue
+            Fn::Sub: 'config-service-${Environment}-private-subnet-2'
+      DeadLetterConfig:
+        TargetArn: !GetAtt RefreshLambdaDLQ.Arn
+      Code:
+        S3Bucket: !ImportValue
+          Fn::Sub: '${DataStackName}-lambda-deployment-bucket'
+        S3Key: 'refresh-trigger.zip'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: config-service
+
+  # Lambda Log Group
+  RefreshLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/config-service-${Environment}-refresh-trigger'
+      RetentionInDays: 7
+      KmsKeyId: !ImportValue
+        Fn::Sub: 'config-service-${Environment}-kms-key-arn'
+
+  ############################################################################
+  #                      EVENTBRIDGE RULES                                   #
+  ############################################################################
+
+  # EventBridge Rule for SSM Parameter Changes
+  SSMParameterChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'config-service-${Environment}-ssm-change'
+      Description: Triggers Lambda when SSM parameters under /config-service/ change
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - Parameter Store Change
+        detail:
+          name:
+            - prefix: !Ref SSMPathPrefix
+          operation:
+            - Create
+            - Update
+            - Delete
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RefreshConfigLambda.Arn
+          Id: RefreshConfigLambdaTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+
+  # Permission for EventBridge to invoke Lambda (SSM)
+  SSMEventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RefreshConfigLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SSMParameterChangeRule.Arn
+
+  # EventBridge Rule for Secrets Manager Changes
+  SecretsManagerChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'config-service-${Environment}-secrets-change'
+      Description: Triggers Lambda when Secrets Manager secrets change
+      EventPattern:
+        source:
+          - aws.secretsmanager
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - PutSecretValue
+            - UpdateSecret
+            - DeleteSecret
+          requestParameters:
+            name:
+              - prefix: 'config-service/'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RefreshConfigLambda.Arn
+          Id: RefreshSecretsLambdaTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+
+  # Permission for EventBridge to invoke Lambda (Secrets Manager)
+  SecretsEventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RefreshConfigLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecretsManagerChangeRule.Arn
+
+  ############################################################################
+  #                      CLOUDWATCH ALARMS                                   #
+  ############################################################################
+
+  # Alarm for Lambda errors
+  RefreshLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'config-service-${Environment}-refresh-lambda-errors'
+      AlarmDescription: Alert when refresh trigger Lambda function fails
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RefreshConfigLambda
+      TreatMissingData: notBreaching
+
+  # Alarm for Lambda throttles
+  RefreshLambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'config-service-${Environment}-refresh-lambda-throttles'
+      AlarmDescription: Alert when refresh trigger Lambda function is throttled
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RefreshConfigLambda
+      TreatMissingData: notBreaching
+
+################################################################################
+#                                  OUTPUTS                                      #
+################################################################################
+
+Outputs:
+  RefreshLambdaArn:
+    Description: Refresh trigger Lambda function ARN
+    Value: !GetAtt RefreshConfigLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-refresh-lambda-arn'
+
+  RefreshLambdaName:
+    Description: Refresh trigger Lambda function name
+    Value: !Ref RefreshConfigLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-refresh-lambda-name'
+
+  SSMChangeRuleArn:
+    Description: EventBridge rule ARN for SSM changes
+    Value: !GetAtt SSMParameterChangeRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ssm-change-rule-arn'
+
+  SecretsChangeRuleArn:
+    Description: EventBridge rule ARN for Secrets Manager changes
+    Value: !GetAtt SecretsManagerChangeRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-secrets-change-rule-arn'
