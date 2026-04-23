@@ -27,7 +27,7 @@
   "dependencies": {
     "@grpc/grpc-js": "^1.11.1",
     "@grpc/proto-loader": "^0.7.13",
-    "uuid": "^9.0.1"
+    "uuid": "^14.0.0"
   },
   "jest": {
     "moduleFileExtensions": [
