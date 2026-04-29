@@ -336,12 +336,12 @@ The service enforces tenant isolation at multiple layers:
 ### Critical Security Design
 
 ```typescript
-// ❌ NEVER DO THIS - vulnerable to tenant bypass
+//  NEVER DO THIS - vulnerable to tenant bypass
 async getConfig(tenantId: string) {
   // tenantId from request parameters - INSECURE
 }
 
-// ✅ ALWAYS DO THIS - extract from JWT claims
+//  ALWAYS DO THIS - extract from JWT claims
 async getConfig(req: AuthenticatedRequest) {
   const tenantId = req.tenantId; // From validated JWT token
 }
